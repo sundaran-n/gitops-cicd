@@ -1,0 +1,135 @@
+name: Property Release Automation - External Repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      BASE_PATH:
+        description: "Base path for the release folder"
+        required: true
+        type: string
+
+env:
+  TARGET_REPO: "Skrishna23/NaaP"  # Change to your actual repo
+  PROPERTIES_BRANCH: "dev-properties"           # Branch where property files are stored
+  RELEASE_BRANCH: "releasemanagement" # Branch where the release folder is stored
+
+jobs:
+  update_properties:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Target Repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.PROPERTIES_BRANCH }}
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch and Checkout Release Folder from Target Repo
+        run: |
+          BASE_PATH="${{ github.event.inputs.BASE_PATH }}"
+          RELEASE_BRANCH="${{ env.RELEASE_BRANCH }}"
+
+          echo "Fetching release branch: $RELEASE_BRANCH from ${{ env.TARGET_REPO }}"
+          git fetch origin "$RELEASE_BRANCH" || { echo "::error::Branch $RELEASE_BRANCH not found!"; exit 1; }
+
+          echo "Checking out release folder from branch: $RELEASE_BRANCH"
+          git checkout origin/"$RELEASE_BRANCH" -- "$BASE_PATH" || { echo "::error::Release folder not found in $RELEASE_BRANCH!"; exit 1; }
+
+          [ -d "$BASE_PATH" ] || { echo "::error::[ERROR] Release folder does not exist: $BASE_PATH"; exit 1; }
+
+      - name: Process Property File Changes (Strict Validation)
+        run: |
+          BASE_PATH="${{ github.event.inputs.BASE_PATH }}"
+          FULL_PATH="$GITHUB_WORKSPACE/$BASE_PATH"
+          LOG_FILE="property_changes.log"
+
+          echo "Processing property file changes..." > "$LOG_FILE"
+
+          find "$FULL_PATH" -type f | while read -r FILE_PATH; do
+            FILE_NAME=$(basename "$FILE_PATH")
+            MATCHING_PROPERTY_FILE="$FILE_NAME.properties"
+
+            if [ ! -f "$MATCHING_PROPERTY_FILE" ]; then
+              echo "::error::[ERROR] Property file '$MATCHING_PROPERTY_FILE' not found in repo!" | tee -a "$LOG_FILE"
+              exit 1
+            fi
+
+            TEMP_FILE="${MATCHING_PROPERTY_FILE}.tmp"
+            cp "$MATCHING_PROPERTY_FILE" "$TEMP_FILE"
+
+            SECTION=""
+            while IFS= read -r line; do
+              [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+              case "$line" in
+                "[ADD]") SECTION="ADD"; continue ;;
+                "[UPDATE]") SECTION="UPDATE"; continue ;;
+                "[REMOVE]") SECTION="REMOVE"; continue ;;
+              esac
+
+              KEY=$(echo "$line" | cut -d= -f1)
+              VALUE=$(echo "$line" | cut -d= -f2-)
+
+              case "$SECTION" in
+                "ADD")
+                  if grep -q "^$KEY=" "$TEMP_FILE"; then
+                    echo "::error::[ERROR] Key '$KEY' already exists in $MATCHING_PROPERTY_FILE, ADD operation failed!" | tee -a "$LOG_FILE"
+                    exit 1
+                  fi
+                  echo "$line" >> "$TEMP_FILE"
+                  echo "[ADD] $KEY=$VALUE -> Added to $MATCHING_PROPERTY_FILE" | tee -a "$LOG_FILE"
+                  ;;
+                "UPDATE")
+                  if grep -q "^$KEY=" "$TEMP_FILE"; then
+                    OLD_VALUE=$(grep "^$KEY=" "$TEMP_FILE" | cut -d= -f2-)
+                    if [[ "$OLD_VALUE" == "$VALUE" ]]; then
+                      echo "::error::[ERROR] Key '$KEY' already has the same value in $MATCHING_PROPERTY_FILE, UPDATE operation failed!" | tee -a "$LOG_FILE"
+                      exit 1
+                    else
+                      sed -i "s|^$KEY=.*|$KEY=$VALUE|" "$TEMP_FILE"
+                      echo "[UPDATE] $KEY: '$OLD_VALUE' -> '$VALUE' in $MATCHING_PROPERTY_FILE" | tee -a "$LOG_FILE"
+                    fi
+                  else
+                    echo "::error::[ERROR] Key '$KEY' not found in $MATCHING_PROPERTY_FILE, UPDATE operation failed!" | tee -a "$LOG_FILE"
+                    exit 1
+                  fi
+                  ;;
+                "REMOVE")
+                  if grep -q "^$KEY=" "$TEMP_FILE"; then
+                    sed -i "/^$KEY=/d" "$TEMP_FILE"
+                    echo "[REMOVE] $KEY removed from $MATCHING_PROPERTY_FILE" | tee -a "$LOG_FILE"
+                  else
+                    echo "::error::[ERROR] Key '$KEY' not found in $MATCHING_PROPERTY_FILE, REMOVE operation failed!" | tee -a "$LOG_FILE"
+                    exit 1
+                  fi
+                  ;;
+              esac
+            done < "$FILE_PATH"
+
+            mv "$TEMP_FILE" "$MATCHING_PROPERTY_FILE"
+          done
+
+      - name: Display Logs
+        run: cat property_changes.log
+
+      - name: Remove Release Folder Before Commit
+        run: |
+          BASE_PATH="${{ github.event.inputs.BASE_PATH }}"
+          [ -d "$BASE_PATH" ] && git rm -rf --cached "$BASE_PATH" || echo "Folder not tracked, skipping removal"
+          rm -rf "$BASE_PATH"
+
+      - name: Commit and Push Changes to Target Repo
+        run: |
+          git add -u
+          if git diff --cached --quiet; then
+            echo "No changes detected, skipping commit."
+            exit 0
+          fi
+          git commit -m "Updated properties from release folder: ${{ github.event.inputs.BASE_PATH }}"
+          git push origin "${{ env.PROPERTIES_BRANCH }}" || { echo "::error::Push failed!"; exit 1; }
