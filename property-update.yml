@@ -1,0 +1,159 @@
+name: Property Release Automation - NaaP
+
+on:
+  workflow_dispatch:
+    inputs:
+      BASE_PATH:
+        description: "Base path for the release folder"
+        required: true
+        type: string
+
+jobs:
+  update_properties:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout CICD Repository (This Repo)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Set up Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Clone GitOps Repository (Without Checking Out Files)
+        run: |
+          set -e
+          GITOPS_REPO="Skrishna23/Project_NaaP"
+          RELEASE_BRANCH="Release"   # 🔹 Branch containing the release folder
+          PROPERTIES_BRANCH="dev-properties"  # 🔹 Branch containing the properties folder
+          BASE_PATH="${{ github.event.inputs.BASE_PATH }}"
+
+          echo "Cloning GitOps repository '$GITOPS_REPO'..."
+          git clone --bare https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/$GITOPS_REPO.git gitops-repo
+          
+          cd gitops-repo
+
+      - name: Fetch & Checkout Release Folder from Release Branch
+        run: |
+          set -e
+          cd gitops-repo
+          git fetch origin $RELEASE_BRANCH
+          git worktree add ../release-folder $RELEASE_BRANCH
+
+          if [ ! -d "../release-folder/$BASE_PATH" ]; then
+            echo "::error::[ERROR] Release folder '$BASE_PATH' does not exist in branch '$RELEASE_BRANCH'!"
+            exit 1
+          fi
+
+          echo "::notice::[SUCCESS] Checked out release folder from '$RELEASE_BRANCH'."
+
+      - name: Fetch & Checkout Properties Folder from Properties Branch
+        run: |
+          set -e
+          cd gitops-repo
+          git fetch origin $PROPERTIES_BRANCH
+          git worktree add ../properties-folder $PROPERTIES_BRANCH
+
+          if [ ! -d "../properties-folder" ]; then
+            echo "::error::[ERROR] Properties folder is missing in branch '$PROPERTIES_BRANCH'!"
+            exit 1
+          fi
+
+          echo "::notice::[SUCCESS] Checked out properties folder from '$PROPERTIES_BRANCH'."
+
+      - name: Process Property File Changes
+        run: |
+          set -e
+          BASE_PATH="../release-folder/${{ github.event.inputs.BASE_PATH }}"
+          PROPERTIES_PATH="../properties-folder"
+          LOG_FILE="property_changes.log"
+
+          echo "Processing changes from $BASE_PATH..." > $LOG_FILE
+
+          for FILE_PATH in $(find "$BASE_PATH" -type f ! -name "*.*"); do
+            FILE_NAME=$(basename "$FILE_PATH")
+            PROPERTY_FILE="$PROPERTIES_PATH/$FILE_NAME.properties"
+
+            if [ ! -f "$PROPERTY_FILE" ]; then
+              echo "::error::[ERROR] Matching property file '$PROPERTY_FILE' not found. Workflow failed!" | tee -a $LOG_FILE
+              exit 1
+            fi
+
+            echo "[INFO] Applying changes from $FILE_PATH to $PROPERTY_FILE" >> $LOG_FILE
+
+            TEMP_FILE="${PROPERTY_FILE}.tmp"
+            cp "$PROPERTY_FILE" "$TEMP_FILE"
+
+            SECTION=""
+            while IFS= read -r line; do
+              [[ -z "$line" || "$line" =~ ^# ]] && continue
+
+              case "$line" in
+                "[ADD]") SECTION="ADD"; continue ;;
+                "[UPDATE]") SECTION="UPDATE"; continue ;;
+                "[REMOVE]") SECTION="REMOVE"; continue ;;
+              esac
+
+              if [[ "$SECTION" == "ADD" ]]; then
+                KEY=$(echo "$line" | cut -d= -f1)
+
+                if grep -q "^$KEY=" "$TEMP_FILE"; then
+                  echo "::error::[ERROR] Key '$KEY' already exists in $PROPERTY_FILE. Workflow failed!" | tee -a $LOG_FILE
+                  exit 1
+                fi
+
+                echo "$line" >> "$TEMP_FILE"
+                echo "[ADD] Added: $line in $PROPERTY_FILE" >> $LOG_FILE
+
+              elif [[ "$SECTION" == "UPDATE" ]]; then
+                KEY=$(echo "$line" | cut -d= -f1)
+                VALUE=$(echo "$line" | cut -d= -f2-)
+
+                if ! grep -q "^$KEY=" "$TEMP_FILE"; then
+                  echo "::error::[ERROR] Key '$KEY' not found in $PROPERTY_FILE for update. Workflow failed!" | tee -a $LOG_FILE
+                  exit 1
+                fi
+
+                OLD_VALUE=$(grep "^$KEY=" "$TEMP_FILE" | cut -d= -f2-)
+
+                if [[ "$OLD_VALUE" == "$VALUE" ]]; then
+                  echo "::error::[ERROR] Key '$KEY' in $PROPERTY_FILE already has the same value. No change detected. Workflow failed!" | tee -a $LOG_FILE
+                  exit 1
+                fi
+
+                sed -i "s|^$KEY=.*|$KEY=$VALUE|" "$TEMP_FILE"
+                echo "[UPDATE] Updated: $KEY=$VALUE in $PROPERTY_FILE" >> $LOG_FILE
+
+              elif [[ "$SECTION" == "REMOVE" ]]; then
+                KEY=$(echo "$line" | cut -d= -f1)
+
+                if ! grep -q "^$KEY=" "$TEMP_FILE"; then
+                  echo "::error::[ERROR] Key '$KEY' not found in $PROPERTY_FILE for removal. Workflow failed!" | tee -a $LOG_FILE
+                  exit 1
+                fi
+
+                sed -i "/^$KEY=/d" "$TEMP_FILE"
+                echo "[DELETE] Removed: $KEY from $PROPERTY_FILE" >> $LOG_FILE
+              fi
+            done < "$FILE_PATH"
+
+            mv "$TEMP_FILE" "$PROPERTY_FILE"
+          done
+
+      - name: Display Logs
+        run: cat property_changes.log
+
+      - name: Commit and Push Changes to Properties Branch
+        run: |
+          cd properties-folder
+          git add -u
+
+          if git diff --cached --quiet; then
+            echo "No changes detected, skipping commit."
+          else
+            git commit -m "Updated properties from release: ${{ github.event.inputs.BASE_PATH }}"
+            git push origin $PROPERTIES_BRANCH
+          fi
